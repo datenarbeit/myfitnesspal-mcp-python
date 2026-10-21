@@ -2096,14 +2096,23 @@ def _relog_args(item: Dict[str, Any]) -> Dict[str, Any]:
     """
     Arguments for mfp_add_food_to_diary that log this entry's amount again.
 
-    mfp_add_food_to_diary picks the serving by unit (preferring value 1.0, see
-    select_serving_size), so quantity is rescaled to that serving: an entry of
-    1 x "100 gramm" becomes quantity 100 against a "1 gramm" serving.
+    For gram/millilitre servings mfp_add_food_to_diary takes the weight or
+    volume, so an entry of 1 x "100 gramm" becomes quantity 100. For other
+    units it picks the serving by unit (preferring value 1.0, see
+    select_serving_size) and takes a count, so quantity is rescaled to that
+    serving.
     """
     food = item.get("food") or {}
     serving = item.get("serving_size") or {}
     unit = serving.get("unit")
     amount = float(item.get("servings") or 0) * float(serving.get("value") or 0)
+    if metric_unit(unit):
+        return {
+            "mfp_id": food.get("id"),
+            "meal": item.get("meal_name"),
+            "quantity": round(amount, 4),
+            "unit": unit,
+        }
 
     wanted = str(unit or "").lower()
     candidates = [

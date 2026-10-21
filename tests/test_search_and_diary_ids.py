@@ -243,6 +243,14 @@ class TestRelogArgs:
         item = _food_entry("Skyr", 0, 120.0, 1.0, "Gramm")
         assert server._relog_args(item)["quantity"] == 120.0
 
+    def test_metric_without_unit_serving_uses_weight(self):
+        # Only a "100 gramm" serving: mfp_add_food_to_diary divides grams by 100.
+        item = _food_entry(
+            "Birne", 0, 0.5, 100.0, "gramm",
+            serving_sizes=[{"value": 100.0, "unit": "gramm", "nutrition_multiplier": 1.0}],
+        )
+        assert server._relog_args(item)["quantity"] == 50.0
+
     def test_counts_servings_of_larger_portion(self):
         item = _food_entry("Brot", 0, 3.0, 50.0, "Scheibe")
         assert server._relog_args(item)["quantity"] == 3.0
