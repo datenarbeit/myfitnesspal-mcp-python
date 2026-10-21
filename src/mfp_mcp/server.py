@@ -116,13 +116,21 @@ def load_cookies() -> Optional[Dict[str, str]]:
         return None
 
 
-def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
+# Several MFP cookies (`__Host-next-auth.*`, `_mfp_session`, `remember_me`) are
+# host-only to www.myfitnesspal.com. Scoped to `.myfitnesspal.com`, the diary
+# still loads, but the food search POST is redirected to the login page and
+# returns no results (verified 2026-10-21: 0 vs 100 hits for "Banane"). The
+# v2 API on api.myfitnesspal.com authenticates by bearer token, not cookies.
+MFP_COOKIE_DOMAIN = "www.myfitnesspal.com"
+
+
+def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = MFP_COOKIE_DOMAIN) -> CookieJar:
     """
     Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
     
     Args:
         cookies_dict: Dictionary of cookie name -> value
-        domain: Domain for the cookies (default: .myfitnesspal.com)
+        domain: Domain for the cookies (default: www.myfitnesspal.com)
     
     Returns:
         CookieJar: A CookieJar object populated with the cookies
@@ -1089,6 +1097,29 @@ class GetStepsInput(BaseModel):
         description="Output format: 'markdown' for human-readable or 'json' for structured data",
     )
 
+class GetRecentFoodsInput(BaseModel):
+    """Input model for listing recently logged foods."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    days: int = Field(
+        default=14,
+        description="How many days back from today to scan the diary (1-31).",
+        ge=1,
+        le=31,
+    )
+    limit: int = Field(
+        default=20,
+        description="Maximum number of foods to return, most frequently logged first.",
+        ge=1,
+        le=100,
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
+
 class GetReportInput(BaseModel):
     """Input model for getting nutrition reports."""
 
@@ -1869,6 +1900,145 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
 # ============================================================================
 
 
+# ============================================================================
+# v2 diary food entries (ids and servings for re-logging)
+#
+# The HTML diary the myfitnesspal library scrapes carries no food ids. The v2
+# diary endpoint does: one request per day, items in diary order, each with
+# `meal_position` (index into the day's meals) and the food's id/version.
+# ============================================================================
+
+
+def get_food_entries_v2(client, target_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetch the day's food entries from the v2 diary API, deleted ones excluded.
+
+    Raises:
+        RuntimeError: If the request fails or the body has an unexpected shape
+    """
+    date_str = target_date.strftime("%Y-%m-%d")
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": date_str, "types": "food_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        detail = _api_error_detail(response)
+        raise RuntimeError(
+            f"Could not fetch diary entries for {date_str}: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+    try:
+        items = response.json().get("items")
+    except Exception:
+        items = None
+    if not isinstance(items, list):
+        raise RuntimeError(
+            f"Unexpected v2 diary response for {date_str}: no 'items' list"
+        )
+    return [
+        i for i in items
+        if i.get("type") == "food_entry" and not i.get("deleted")
+    ]
+
+
+def _relog_args(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Arguments for mfp_add_food_to_diary that log this entry's amount again.
+
+    mfp_add_food_to_diary picks the serving by unit (preferring value 1.0, see
+    select_serving_size), so quantity is rescaled to that serving: an entry of
+    1 x "100 gramm" becomes quantity 100 against a "1 gramm" serving.
+    """
+    food = item.get("food") or {}
+    serving = item.get("serving_size") or {}
+    unit = serving.get("unit")
+    amount = float(item.get("servings") or 0) * float(serving.get("value") or 0)
+
+    wanted = str(unit or "").lower()
+    candidates = [
+        s for s in food.get("serving_sizes") or []
+        if str(s.get("unit", "")).lower() == wanted
+    ]
+    chosen = next((c for c in candidates if c.get("value") == 1.0), None)
+    if chosen is None and candidates:
+        chosen = candidates[0]
+    divisor = float(chosen.get("value") or 1) if chosen else float(serving.get("value") or 1)
+
+    return {
+        "mfp_id": food.get("id"),
+        "meal": item.get("meal_name"),
+        "quantity": round(amount / divisor, 4) if divisor else item.get("servings"),
+        "unit": unit,
+    }
+
+
+def _food_entry_ref(item: Dict[str, Any]) -> Dict[str, Any]:
+    """The ids and serving of a v2 diary food entry."""
+    food = item.get("food") or {}
+    serving = item.get("serving_size") or {}
+    return {
+        "entry_id": item.get("id"),
+        "food_id": food.get("id"),
+        "food_version": food.get("version"),
+        "servings": item.get("servings"),
+        "serving_size": {
+            "value": serving.get("value"),
+            "unit": serving.get("unit"),
+            "nutrition_multiplier": serving.get("nutrition_multiplier"),
+        },
+        "relog": _relog_args(item),
+    }
+
+
+def _norm_name(name: Any) -> str:
+    """Compare names the way both sources render them (NBSPs, spacing, case)."""
+    return " ".join(str(name or "").replace("\xa0", " ").split()).lower()
+
+
+def match_food_entries(
+    meal_entry_names: List[List[str]], items: List[Dict[str, Any]]
+) -> List[List[Optional[Dict[str, Any]]]]:
+    """
+    Pair HTML diary entries with v2 items, per meal.
+
+    HTML names look like "<description>, <quantity> <unit>"; v2 items carry the
+    description and `meal_position` (the meal's index). Within a meal each HTML
+    entry takes the first unused item whose description matches, so repeated
+    foods pair up in diary order. Unmatched entries get None.
+
+    Args:
+        meal_entry_names: Entry names per meal, in the order of day.meals
+        items: Food entries from get_food_entries_v2
+
+    Returns:
+        A ref dict (see _food_entry_ref) or None, per entry, per meal
+    """
+    result = []
+    for position, names in enumerate(meal_entry_names):
+        pool = [i for i in items if i.get("meal_position") == position]
+        used = set()
+        refs: List[Optional[Dict[str, Any]]] = []
+        for name in names:
+            entry = _norm_name(name)
+            match = None
+            for idx, item in enumerate(pool):
+                if idx in used:
+                    continue
+                desc = _norm_name((item.get("food") or {}).get("description"))
+                if desc and (entry == desc or entry.startswith(desc + ",")):
+                    match = idx
+                    break
+            if match is None:
+                refs.append(None)
+            else:
+                used.add(match)
+                refs.append(_food_entry_ref(pool[match]))
+        result.append(refs)
+    return result
+
+
 @mcp.tool(
     name="mfp_get_diary",
     annotations={
@@ -1886,6 +2056,11 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
     Returns meals (Breakfast, Lunch, Dinner, Snacks) with each food entry's name,
     quantity, and complete nutrition breakdown (calories, protein, carbs, fat, etc.).
     Also includes daily totals and goals.
+
+    Each entry also carries `entry_id`, `food_id`, `food_version`, `servings`,
+    `serving_size` and `relog`: the arguments for mfp_add_food_to_diary that log
+    the same food and amount again (change `meal`/`date` as needed). If the ids
+    cannot be fetched, the diary is still returned with an `ids_error` field.
 
     Args:
         params: GetDiaryInput containing:
@@ -1910,10 +2085,27 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
             "notes": day.notes or "",
         }
 
+        # Food ids/servings come from the v2 API; the diary itself still works
+        # without them, so a failure is reported next to it, not raised.
+        refs = [[None] * len(meal.entries) for meal in day.meals]
+        try:
+            items = get_food_entries_v2(client, target_date)
+            refs = match_food_entries(
+                [[e.name for e in meal.entries] for meal in day.meals], items
+            )
+        except Exception as e:
+            data["ids_error"] = f"Food ids unavailable: {e}"
+
         # Process meals
-        for meal in day.meals:
+        for meal, meal_refs in zip(day.meals, refs):
+            entries = []
+            for entry, ref in zip(meal.entries, meal_refs):
+                formatted = format_meal_entry(entry)
+                if ref:
+                    formatted.update(ref)
+                entries.append(formatted)
             meal_data = {
-                "entries": [format_meal_entry(entry) for entry in meal.entries],
+                "entries": entries,
                 "totals": format_nutrition_dict(meal.totals),
             }
             data["meals"][meal.name] = meal_data
@@ -1933,6 +2125,64 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
 
     except Exception as e:
         return f"Error retrieving diary: {str(e)}"
+
+
+MFP_FOOD_SEARCH_URL = f"{MFP_WEB_BASE}/food/search"
+
+
+def _check_search_response(response, step: str):
+    """Raise instead of letting a login page or error pass as "no results"."""
+    if response.status_code != 200:
+        raise RuntimeError(f"Food search {step} failed: HTTP {response.status_code}")
+    if "/account/login" in str(getattr(response, "url", "")):
+        raise RuntimeError(
+            f"Food search {step} was redirected to the MyFitnessPal login page: "
+            "the session cookies are not accepted for www.myfitnesspal.com. "
+            "Renew the cookies."
+        )
+
+
+def search_foods(client, query: str) -> list:
+    """
+    Search the food database via the web search form.
+
+    Same request flow as myfitnesspal.Client.get_food_search_results, but it
+    fails loudly: the library treats any page containing "Matching Foods:" as a
+    result page, and the login page MFP redirects to contains that text too, so
+    a rejected session used to look like zero hits.
+
+    Returns:
+        List of myfitnesspal FoodItem objects (empty only for a genuine no-match)
+
+    Raises:
+        RuntimeError: On a non-200 response, a login redirect, or a page that
+            is not a search result page
+    """
+    import lxml.html
+
+    page = client.session.get(MFP_FOOD_SEARCH_URL, timeout=30)
+    _check_search_response(page, "page")
+    tokens = lxml.html.document_fromstring(page.content).xpath(
+        "(//input[@name='authenticity_token']/@value)[1]"
+    )
+    if not tokens:
+        raise RuntimeError("Food search page has no authenticity token (layout changed?)")
+
+    result = client.session.post(
+        MFP_FOOD_SEARCH_URL,
+        data={
+            "authenticity_token": tokens[0],
+            "search": query,
+            "date": date.today().strftime("%Y-%m-%d"),
+            "meal": "0",
+        },
+        timeout=30,
+    )
+    _check_search_response(result, "request")
+    content = result.content.decode("utf8")
+    if "Matching Foods:" not in content:
+        raise RuntimeError("Food search returned an unexpected page (no result list)")
+    return client._get_food_search_results(lxml.html.document_fromstring(content))
 
 
 @mcp.tool(
@@ -1963,7 +2213,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
+        results = search_foods(client, params.query)
 
         # Limit results
         results = results[: params.limit]
@@ -2533,6 +2783,97 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
 
     except Exception as e:
         return f"Error getting steps: {str(e)}"
+
+
+def get_recent_foods(client, start: date, end: date) -> List[Dict[str, Any]]:
+    """
+    Aggregate logged foods from start to end inclusive, one v2 request per day.
+
+    Returns one record per food id, most frequently logged first (ties: most
+    recently used first). `relog` reproduces the most recent entry's amount.
+
+    Raises:
+        RuntimeError: If any day's request fails
+    """
+    foods: Dict[str, Dict[str, Any]] = {}
+    current = start
+    while current <= end:
+        for item in get_food_entries_v2(client, current):
+            food = item.get("food") or {}
+            food_id = food.get("id")
+            if not food_id:
+                continue
+            day = item.get("date") or current.strftime("%Y-%m-%d")
+            record = foods.get(food_id)
+            if record is None:
+                record = foods[food_id] = {
+                    "name": " ".join(str(food.get("description") or "").split()),
+                    "brand": food.get("brand_name"),
+                    "food_id": food_id,
+                    "times_logged": 0,
+                    "last_used": day,
+                    "meals": [],
+                }
+            record["times_logged"] += 1
+            meal = item.get("meal_name")
+            if meal and meal not in record["meals"]:
+                record["meals"].append(meal)
+            # Days are walked in order, so a later entry is the newest one.
+            if day >= record["last_used"] or "relog" not in record:
+                record["last_used"] = day
+                record["food_version"] = food.get("version")
+                record["last_serving"] = _food_entry_ref(item)["serving_size"]
+                record["last_servings"] = item.get("servings")
+                record["relog"] = _relog_args(item)
+        current += timedelta(days=1)
+
+    newest_first = sorted(foods.values(), key=lambda r: r["last_used"], reverse=True)
+    return sorted(newest_first, key=lambda r: r["times_logged"], reverse=True)
+
+
+@mcp.tool(
+    name="mfp_get_recent_foods",
+    annotations={
+        "title": "Get Recently Logged Foods",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_recent_foods(params: GetRecentFoodsInput) -> str:
+    """
+    List the foods logged in the diary over the last N days, most frequent first.
+
+    Each food has its `food_id`, how often and when it was last logged, the meals
+    it was logged in, and `relog`: the arguments for mfp_add_food_to_diary that
+    log the most recent amount again (change `meal`/`date` as needed).
+
+    Args:
+        params: GetRecentFoodsInput containing:
+            - days (int): Days back from today to scan (default 14, max 31)
+            - limit (int): Maximum foods to return (default 20)
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: Recently logged foods with ids and serving info
+    """
+    try:
+        end = date.today()
+        start = end - timedelta(days=params.days - 1)
+        client = get_mfp_client()
+        # One blocking request per day; keep the event loop free (see mfp_get_steps).
+        foods = await asyncio.to_thread(get_recent_foods, client, start, end)
+        data = {
+            "start_date": str(start),
+            "end_date": str(end),
+            "count": min(len(foods), params.limit),
+            "foods": foods[: params.limit],
+        }
+        return format_response(data, params.response_format, "Recently Logged Foods")
+
+    except Exception as e:
+        return f"Error getting recent foods: {str(e)}"
 
 
 @mcp.tool(

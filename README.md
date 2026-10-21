@@ -6,8 +6,9 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `mfp_get_diary` | Read | Get food diary entries for any date |
-| `mfp_search_food` | Read | Search the MyFitnessPal food database |
+| `mfp_get_diary` | Read | Get food diary entries for any date, with food id, serving and ready-made `relog` arguments per entry |
+| `mfp_search_food` | Read | Search the MyFitnessPal food database (a rejected session is an error, not zero hits) |
+| `mfp_get_recent_foods` | Read | Foods logged in the last N days, most frequent first, with ids and `relog` arguments |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
 | `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
@@ -27,6 +28,12 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_delete_fast` | Write | Delete a fasting entry by id |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
 | `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
+
+## Smoke check
+
+`python -m mfp_mcp.smoke` runs a live search for "Banane" with the server's login and
+exits non-zero unless it returns results. Run it where the server runs (e.g. `docker exec`
+into its container) after renewing cookies or upgrading.
 
 ## How diary writes work
 
