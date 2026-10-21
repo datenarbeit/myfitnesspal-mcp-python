@@ -1136,10 +1136,12 @@ class AddFoodToDiaryInput(BaseModel):
     quantity: float = Field(
         default=1.0,
         description=(
-            "Quantity to log. Interpretation depends on the food's serving unit:\n"
-            "- For gram-based foods (serving unit = 'g', 'gramo', etc.), pass the actual "
-            "weight in grams (e.g. 120 for 120 g of salmon, 200 for 200 g of mango).\n"
-            "- For serving-based foods, pass the number of servings (e.g. 1.5).\n"
+            "Quantity to log. Interpretation depends on the serving logged against:\n"
+            "- Gram/millilitre servings (unit 'g', 'gram', 'Gramm', 'ml', ...; chosen when "
+            "`unit` is such a unit, or when `unit` is omitted and the food's default "
+            "serving is one): the actual weight or volume, e.g. 120 for 120 g of salmon, "
+            "200 for 200 ml of milk, whatever the food's serving value (100 g or 1 g).\n"
+            "- Other servings (piece, cup, oz, ...): the number of servings (e.g. 1.5).\n"
             "- For placeholder / meal-plan entries not yet consumed, pass a small value "
             "such as 0.1 or 1 so the item appears in the diary with near-zero calories "
             "and can be updated with the real weight after the meal.\n"
@@ -1151,7 +1153,14 @@ class AddFoodToDiaryInput(BaseModel):
     )
     unit: Optional[str] = Field(
         default=None,
-        description="Unit/serving size description (e.g., '1 cup', '100g'). If not provided, uses default serving size from food item.",
+        description=(
+            "Serving unit to log against, matched case-insensitively against the food's "
+            "serving units (e.g. 'g', 'ml', 'cup', 'medium'). 'g'/'gram'/'Gramm' and "
+            "'ml'/'milliliter' match any spelling of that unit; if the food has no such "
+            "serving, nothing is logged and the error lists the available units. Other "
+            "units also match on a substring and fall back to the default serving. If "
+            "omitted, the food's default serving is used."
+        ),
     )
 
 
@@ -1355,28 +1364,68 @@ def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
     return items[0]
 
 
+# Gram and millilitre spellings MFP uses across locales and foods ("g",
+# "gram", "Gramm", "gramo", ...), keyed by the unit they measure in.
+METRIC_UNITS = {
+    "g": {
+        "g", "gr", "gram", "grams", "gramm", "gramme", "grammes", "gramo",
+        "gramos", "grama", "gramas", "grammo", "grammi",
+    },
+    "ml": {
+        "ml", "milliliter", "milliliters", "millilitre", "millilitres",
+        "mililitro", "mililitros", "millilitro", "millilitri",
+    },
+}
+
+
+def metric_unit(unit: Optional[str]) -> Optional[str]:
+    """Return "g" or "ml" if `unit` is a gram/millilitre spelling, else None."""
+    name = str(unit or "").strip().lower().rstrip(".")
+    for key, names in METRIC_UNITS.items():
+        if name in names:
+            return key
+    return None
+
+
 def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dict[str, Any]:
     """
     Choose which of a food's serving sizes to log against.
 
+    Gram/millilitre servings: when `unit` is a gram or millilitre spelling,
+    or when it is omitted and the food's default serving is one, the serving
+    is picked among that food's servings in the same unit, preferring the one
+    with value 1.0 (one serving = 1 g). Many foods list "100 g" first and
+    "1 g" second; logging against the "100 g" one turned 50 g into 5000 g.
+
     Args:
         food: Food object from get_food_v2
-        unit: Optional unit to match (e.g. "oz", "medium breast"). Matching is
-            case-insensitive and accepts a substring. Falls back to the food's
-            default (first) serving size when omitted or unmatched.
+        unit: Optional unit to match (e.g. "g", "oz", "medium breast"). Matching
+            is case-insensitive; other units also accept a substring and fall
+            back to the food's default (first) serving size when unmatched.
 
     Returns:
         The serving size dict, trimmed to the fields the diary API permits
 
     Raises:
-        RuntimeError: If the food declares no serving sizes
+        RuntimeError: If the food declares no serving sizes, or a gram/millilitre
+            unit was asked for and the food has no serving in it
     """
     serving_sizes = food.get("serving_sizes") or []
     if not serving_sizes:
         raise RuntimeError(f"Food {food.get('id')} has no serving sizes")
 
     chosen = serving_sizes[0]
-    if unit:
+    wanted_metric = metric_unit(unit) if unit else metric_unit(chosen.get("unit"))
+    if wanted_metric:
+        metric = [s for s in serving_sizes if metric_unit(s.get("unit")) == wanted_metric]
+        if not metric:
+            available = ", ".join(f"{s.get('value'):g} {s.get('unit')}" for s in serving_sizes)
+            raise RuntimeError(
+                f"Food {food.get('id')} has no serving in {wanted_metric} "
+                f"(available: {available}). Pass one of these units instead."
+            )
+        chosen = next((s for s in metric if s.get("value") == 1.0), metric[0])
+    elif unit:
         wanted = unit.strip().lower()
         exact = [s for s in serving_sizes if str(s.get("unit", "")).lower() == wanted]
         substring = [
@@ -1620,28 +1669,102 @@ def delete_custom_food(client, food_id: str) -> int:
     return r.status_code
 
 
+def servings_for_quantity(serving_size: Dict[str, Any], quantity: float) -> float:
+    """
+    Number of servings to store for `quantity`.
+
+    For a gram/millilitre serving, quantity is the weight or volume
+    (50 = 50 g), so it is divided by the serving's value: 50 g against a
+    "100 g" serving is 0.5 servings. Otherwise quantity is a count of servings.
+    """
+    value = float(serving_size.get("value") or 0)
+    if metric_unit(serving_size.get("unit")) and value > 0:
+        return float(quantity) / value
+    return float(quantity)
+
+
+def logged_amount(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    What a v2 diary food entry actually stores, in the terms of
+    mfp_add_food_to_diary: grams/ml for gram/millilitre servings, else a
+    count of servings. Includes the entry's energy as MFP computed it.
+    """
+    serving = item.get("serving_size") or {}
+    servings = float(item.get("servings") or 0)
+    value = float(serving.get("value") or 0)
+    unit = serving.get("unit")
+    metric = metric_unit(unit)
+    energy = (item.get("nutritional_contents") or {}).get("energy") or {}
+    result: Dict[str, Any] = {
+        "quantity": round(servings * value, 4) if metric else servings,
+        "unit": metric or unit,
+        "servings": servings,
+        "serving_size": {"value": value, "unit": unit},
+        "energy": energy.get("value"),
+        "energy_unit": energy.get("unit"),
+    }
+    if energy.get("unit") == "calories" and energy.get("value") is not None:
+        result["calories"] = round(float(energy["value"]), 1)
+    return result
+
+
+def fetch_diary_entry(client, target_date: date, entry_id: str) -> Optional[Dict[str, Any]]:
+    """Read one food entry back from the v2 diary, or None if it is not there."""
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": target_date.strftime("%Y-%m-%d"), "types": "food_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read the diary back: HTTP {response.status_code}")
+    for item in response.json().get("items") or []:
+        if item.get("id") == entry_id:
+            return item
+    return None
+
+
+def _logged_mismatch(
+    logged: Dict[str, Any], serving_size: Dict[str, Any], quantity: float
+) -> Optional[str]:
+    """Why the stored entry differs from the request by more than 1 %, or None."""
+    wanted_unit = metric_unit(serving_size["unit"]) or serving_size["unit"]
+    if str(logged["unit"]).lower() != str(wanted_unit).lower():
+        return f"stored unit {logged['unit']!r} instead of {wanted_unit!r}"
+    if abs(logged["quantity"] - quantity) > 0.01 * quantity + 1e-9:
+        return f"stored {logged['quantity']:g} {logged['unit']} instead of {quantity:g}"
+    return None
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
-) -> Optional[str]:
+) -> Dict[str, Any]:
     """
     Add a food item to the diary for a specific date and meal.
+
+    The entry is read back after writing. If the stored amount differs from
+    the request by more than 1 %, it is deleted again and an error raised:
+    no entry is better than a wrong one.
 
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal food item ID
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
-        quantity: Number of servings (default 1.0)
-        unit: Optional serving unit to log against (e.g. "oz")
+        quantity: Grams/ml for gram/millilitre servings, else number of
+            servings (default 1.0)
+        unit: Optional serving unit to log against (e.g. "g", "oz")
 
     Returns:
-        The new entry's UUID, or None if MFP did not return one
+        {"entry_id", "food_name", "logged"}, where logged is what the diary
+        stores (see logged_amount)
 
     Raises:
-        RuntimeError: If the operation fails
+        RuntimeError: If the operation fails or the stored entry is wrong
     """
     food = get_food_v2(client, mfp_id)
     serving_size = select_serving_size(food, unit)
+    servings = servings_for_quantity(serving_size, quantity)
 
     meal_name = meal.strip().capitalize()
     if meal_name not in VALID_MEALS:
@@ -1653,7 +1776,7 @@ def add_food_to_diary(
         "type": "food_entry",
         "date": target_date.strftime("%Y-%m-%d"),
         "meal_name": meal_name,
-        "servings": float(quantity),
+        "servings": servings,
         "food": {"id": str(food["id"]), "version": str(food["version"])},
         "serving_size": serving_size,
     }
@@ -1681,16 +1804,42 @@ def add_food_to_diary(
 
     logger.info(
         f"Added food {mfp_id} ({serving_size['value']} {serving_size['unit']} "
-        f"x{quantity}) to {meal_name} for {target_date}"
+        f"x{servings}) to {meal_name} for {target_date}"
     )
 
     # MFP returns the new entry's id here and nowhere else - the diary page
     # exposes only legacy numeric ids, which the v2 API does not accept.
     try:
-        return response.json()["items"][0]["id"]
+        entry_id = response.json()["items"][0]["id"]
     except (ValueError, KeyError, IndexError):
-        logger.warning("Entry created but MyFitnessPal returned no entry id")
-        return None
+        raise RuntimeError(
+            "Entry created but MyFitnessPal returned no entry id, so it could not be "
+            f"verified. Check {meal_name} on {target_date} in the diary."
+        )
+
+    item = fetch_diary_entry(client, target_date, entry_id)
+    if item is None:
+        problem = "entry not found when reading the diary back"
+        logged = None
+    else:
+        logged = logged_amount(item)
+        problem = _logged_mismatch(logged, serving_size, quantity)
+
+    if problem:
+        try:
+            remove_diary_entry_v2(client, entry_id)
+        except Exception as e:
+            raise RuntimeError(
+                f"Logged entry is wrong ({problem}) and could not be removed: {e}. "
+                f"Delete entry {entry_id} on {target_date} by hand."
+            )
+        raise RuntimeError(f"Logged entry was wrong ({problem}); removed it again.")
+
+    return {
+        "entry_id": entry_id,
+        "food_name": food.get("description") or "Food item",
+        "logged": logged,
+    }
 
 
 def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
@@ -2557,14 +2706,18 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
             - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - quantity (float): For gram-based foods pass the actual weight in grams (e.g. 120
-              for 120 g); for serving-based foods pass the number of servings (e.g. 1.5).
+            - quantity (float): For gram/millilitre servings the actual weight or volume
+              (e.g. 120 for 120 g); otherwise the number of servings (e.g. 1.5).
               Use 0.1 or 1 as a placeholder for meals not yet consumed — update to the real
               weight after eating. Range: (0, 10 000].
-            - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
+            - unit (str, optional): Serving unit (e.g. 'g', 'ml', 'cup'); default serving if omitted
+
+    The entry is read back after writing; if it stores more than 1 % off the
+    request it is removed again and an error returned.
 
     Returns:
-        str: Confirmation message with details of the added food entry
+        str: Confirmation with the entry id and `logged`: the stored quantity,
+            unit, servings, serving size and calories
     """
     try:
         client = get_mfp_client()
@@ -2576,7 +2729,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             meal = "Snacks"
         
         # Add food to diary
-        entry_id = add_food_to_diary(
+        added = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
             meal=meal,
@@ -2584,16 +2737,17 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
             unit=params.unit,
         )
-
-        try:
-            food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
-        except Exception:
-            food_name = "Food item"
+        entry_id = added["entry_id"]
+        food_name = added["food_name"]
+        logged = added["logged"]
 
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully added {food_name} to {meal}",
+                "message": (
+                    f"Added {logged['quantity']:g} {logged['unit']} of {food_name} to {meal}"
+                    + (f" ({logged['calories']:g} kcal)" if "calories" in logged else "")
+                ),
                 "entry_id": entry_id,
                 "date": str(target_date),
                 "meal": meal,
@@ -2601,6 +2755,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
                 "food_name": food_name,
                 "quantity": params.quantity,
                 "unit": params.unit,
+                "logged": logged,
             },
             indent=2,
         )

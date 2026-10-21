@@ -678,8 +678,14 @@ Add a food item to your diary for a specific meal and date.
 - `mfp_id` (required): MyFitnessPal food ID from search results (use `mfp_search_food` first)
 - `meal` (optional): Meal name - "Breakfast", "Lunch", "Dinner", or "Snacks" (default: "Breakfast")
 - `date` (optional): YYYY-MM-DD format (default: today)
-- `quantity` (optional): Number of servings (default: 1.0)
-- `unit` (optional): Unit/serving size description (e.g., "1 cup", "100g")
+- `quantity` (optional, default 1.0): for gram/millilitre servings the actual weight or volume
+  (50 = 50 g, also when the food's default serving is "100 g"); otherwise the number of servings
+- `unit` (optional): serving unit, e.g. "g", "ml", "cup". Any spelling of gram/millilitre
+  ("gram", "Gramm", "milliliter") selects the food's gram/ml serving; omitted = default serving
+
+The entry is read back after writing. If the diary stores more than 1 % off the request, the
+entry is removed again and an error returned. The response's `logged` shows the stored
+quantity, unit and calories.
 
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
